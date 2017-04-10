@@ -1125,6 +1125,10 @@ bool Process::DoEvents()
 	}
 #endif /* _WIN32 */
 
+	/* Don't forward process result if application is shutting down. */
+	if (Application::IsShuttingDown())
+		return false;
+
 	m_Result.PID = m_PID;
 	m_Result.ExecutionEnd = Utility::GetTime();
 	m_Result.ExitStatus = exitcode;
