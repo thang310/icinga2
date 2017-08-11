@@ -51,4 +51,3 @@ String& String::operator+=(const Value& rhs)
 	m_Data += static_cast<String>(rhs);
 	return *this;
 }
-

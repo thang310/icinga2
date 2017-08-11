@@ -16,7 +16,7 @@
 # Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA.
 
 set(cli_SOURCES
-  apisetupcommand.cpp apisetuputility.cpp
+  apisetupcommand.cpp apiusercommand.cpp apisetuputility.cpp
   calistcommand.cpp casigncommand.cpp
   nodesetupcommand.cpp nodewizardcommand.cpp nodeutility.cpp
   clicommand.cpp

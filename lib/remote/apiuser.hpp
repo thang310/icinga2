@@ -22,6 +22,7 @@
 
 #include "remote/i2-remote.hpp"
 #include "remote/apiuser.thpp"
+#include "base/dictionary.hpp"
 
 namespace icinga
 {
@@ -35,7 +36,13 @@ public:
 	DECLARE_OBJECT(ApiUser);
 	DECLARE_OBJECTNAME(ApiUser);
 
+	virtual void OnConfigLoaded(void) override;
+
 	static ApiUser::Ptr GetByClientCN(const String& cn);
+	static String CreateHashedPasswordString(const String& password, const String& salt, const bool shadow = false);
+
+	Dictionary::Ptr GetPasswordDict(void) const;
+	bool ComparePassword(String password) const;
 };
 
 }
