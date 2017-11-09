@@ -260,41 +260,33 @@ int NodeSetupCommand::SetupNode(const boost::program_options::variables_map& vm,
 		    << "Requesting certificate with ticket '" << ticket << "'.";
 	}
 
-	/* require master host information for auto-signing requests */
-
-	if (!vm.count("master_host")) {
-		Log(LogCritical, "cli", "Please pass the master host connection information for auto-signing using '--master_host <host>'. This can also be a direct parent satellite since 2.8.");
-
-		return 1;
-	}
-
-	std::vector<String> tokens;
-	boost::algorithm::split(tokens, vm["master_host"].as<std::string>(), boost::is_any_of(","));
+	bool connectToParent = false;
 	String master_host;
 	String master_port = "5665";
+	boost::shared_ptr<X509> trustedParentCert;
 
-	if (tokens.size() == 1 || tokens.size() == 2)
-		master_host = tokens[0];
+	/* Decide whether to directly connect to the parent node for CSR signing, or leave it to the user. */
+	if (!vm.count("master_host")) {
+		connectToParent = false;
 
-	if (tokens.size() == 2)
-		master_port = tokens[1];
+		Log(LogWarning, "cli")
+		    << "Node to master/satellite connection setup skipped. Please configure your parent node to\n"
+		    << "connect to this node by setting the 'host' attribute for the node Endpoint object.\n";
+	} else {
+		connectToParent = true;
 
-	Log(LogInformation, "cli")
-	    << "Verifying parent host connection information: host '" << master_host << "', port '" << master_port << "'.";
+		std::vector<String> tokens;
+		boost::algorithm::split(tokens, vm["master_host"].as<std::string>(), boost::is_any_of(","));
+		if (tokens.size() == 1 || tokens.size() == 2)
+			master_host = tokens[0];
 
-	/* trusted cert must be passed (retrieved by the user with 'pki save-cert' before) */
+		if (tokens.size() == 2)
+			master_port = tokens[1];
 
-	if (!vm.count("trustedcert")) {
-		Log(LogCritical, "cli")
-		    << "Please pass the trusted cert retrieved from the parent node (master or satellite)\n"
-		    << "(Hint: 'icinga2 pki save-cert --host <masterhost> --port <5665> --key local.key --cert local.crt --trustedcert master.crt').";
-		return 1;
+		Log(LogInformation, "cli")
+		    << "Verifying parent host connection information: host '" << master_host << "', port '" << master_port << "'.";
+
 	}
-
-	boost::shared_ptr<X509> trustedcert = GetX509Certificate(vm["trustedcert"].as<std::string>());
-
-	Log(LogInformation, "cli")
-	    << "Verifying trusted certificate file '" << vm["trustedcert"].as<std::string>() << "'.";
 
 	/* retrieve CN and pass it (defaults to FQDN) */
 	String cn = Utility::GetFQDN();
@@ -306,57 +298,97 @@ int NodeSetupCommand::SetupNode(const boost::program_options::variables_map& vm,
 	    << "Using the following CN (defaults to FQDN): '" << cn << "'.";
 
 	/* pki request a signed certificate from the master */
-
-	String pki_path = ApiListener::GetCertsDir();
-	Utility::MkDirP(pki_path, 0700);
+	String certsDir = ApiListener::GetCertsDir();
+	Utility::MkDirP(certsDir, 0700);
 
 	String user = ScriptGlobal::Get("RunAsUser");
 	String group = ScriptGlobal::Get("RunAsGroup");
 
-	if (!Utility::SetFileOwnership(pki_path, user, group)) {
+	if (!Utility::SetFileOwnership(certsDir, user, group)) {
 		Log(LogWarning, "cli")
-		    << "Cannot set ownership for user '" << user << "' group '" << group << "' on file '" << pki_path << "'. Verify it yourself!";
+		    << "Cannot set ownership for user '" << user
+		    << "' group '" << group
+		    << "' on file '" << certsDir << "'. Verify it yourself!";
 	}
 
-	String key = pki_path + "/" + cn + ".key";
-	String cert = pki_path + "/" + cn + ".crt";
-	String ca = pki_path + "/ca.crt";
+	String nodeCert = certsDir + "/" + cn + ".crt";
+	String nodeKey = certsDir + "/" + cn + ".key";
 
-	if (Utility::PathExists(key))
-		NodeUtility::CreateBackupFile(key, true);
-	if (Utility::PathExists(cert))
-		NodeUtility::CreateBackupFile(cert);
+	if (Utility::PathExists(nodeKey))
+		NodeUtility::CreateBackupFile(nodeKey, true);
+	if (Utility::PathExists(nodeCert))
+		NodeUtility::CreateBackupFile(nodeCert);
 
-	if (PkiUtility::NewCert(cn, key, String(), cert) != 0) {
-		Log(LogCritical, "cli", "Failed to generate new self-signed certificate.");
+	if (PkiUtility::NewCert(cn, nodeKey, Empty, nodeCert) > 0) {
+		Log(LogCritical, "cli")
+		    << "Failed to create new self-signed certificate for CN '"
+		    << cn << "'. Please try again.";
 		return 1;
 	}
 
 	/* fix permissions: root -> icinga daemon user */
-	if (!Utility::SetFileOwnership(key, user, group)) {
+	if (!Utility::SetFileOwnership(nodeKey, user, group)) {
 		Log(LogWarning, "cli")
-		    << "Cannot set ownership for user '" << user << "' group '" << group << "' on file '" << key << "'. Verify it yourself!";
+		    << "Cannot set ownership for user '" << user
+		    << "' group '" << group
+		    << "' on file '" << nodeKey << "'. Verify it yourself!";
 	}
 
-	Log(LogInformation, "cli", "Requesting a signed certificate from the parent Icinga node.");
+	String nodeCA = certsDir + "/ca.crt";
 
-	if (PkiUtility::RequestCertificate(master_host, master_port, key, cert, ca, trustedcert, ticket) > 0) {
-		Log(LogCritical, "cli")
-		    << "Failed to fetch signed certificate from parent Icinga node '"
-		    << master_host << ", "
-		    << master_port << "'. Please try again.";
-		return 1;
+	/* Send a signing request to the master immediately, or leave it to the user. */
+	if (connectToParent) {
+		/* In contrast to `node wizard` the user must manually fetch
+		 * the trustedParentCert to prove the trust relationship (fetched with 'pki save-cert').
+		 */
+		if (!vm.count("trustedcert")) {
+			Log(LogCritical, "cli")
+			    << "Please pass the trusted cert retrieved from the parent node (master or satellite)\n"
+			    << "(Hint: 'icinga2 pki save-cert --host <masterhost> --port <5665> --key local.key --cert local.crt --trustedcert master.crt').";
+			return 1;
+		}
+
+		trustedParentCert = GetX509Certificate(vm["trustedcert"].as<std::string>());
+
+		Log(LogInformation, "cli")
+		    << "Verifying trusted certificate file '" << vm["trustedcert"].as<std::string>() << "'.";
+
+		Log(LogInformation, "cli", "Requesting a signed certificate from the parent Icinga node.");
+
+		if (PkiUtility::RequestCertificate(master_host, master_port, nodeKey, nodeCert, nodeCA, trustedParentCert, ticket) > 0) {
+			Log(LogCritical, "cli")
+			    << "Failed to fetch signed certificate from parent Icinga node '"
+			    << master_host << ", "
+			    << master_port << "'. Please try again.";
+			return 1;
+		}
+	} else {
+		/* We cannot retrieve the parent certificate.
+		 * Tell the user to manually copy the ca.crt file
+		 * into LocalStateDir + "/lib/icinga2/certs"
+		 */
+
+		Log(LogWarning, "cli")
+		    << "\nNo connection to the parent node was specified.\n\n"
+		    << "Please copy the public CA certificate from your master/satellite\n"
+		    << "into '" << nodeCA << "' before starting Icinga 2.\n";
+
+		if (Utility::PathExists(nodeCA)) {
+			Log(LogInformation, "cli")
+			    << "\nFound public CA certificate in '" << nodeCA << "'.\n"
+			    << "Please verify that it is the same as on your master/satellite.\n";
+		}
 	}
 
-	if (!Utility::SetFileOwnership(ca, user, group)) {
+	if (!Utility::SetFileOwnership(nodeCA, user, group)) {
 		Log(LogWarning, "cli")
-		    << "Cannot set ownership for user '" << user << "' group '" << group << "' on file '" << ca << "'. Verify it yourself!";
+		    << "Cannot set ownership for user '" << user << "' group '" << group << "' on file '" << nodeCA << "'. Verify it yourself!";
 	}
 
 	/* fix permissions (again) when updating the signed certificate */
-	if (!Utility::SetFileOwnership(cert, user, group)) {
+	if (!Utility::SetFileOwnership(nodeCert, user, group)) {
 		Log(LogWarning, "cli")
-		    << "Cannot set ownership for user '" << user << "' group '" << group << "' on file '" << cert << "'. Verify it yourself!";
+		    << "Cannot set ownership for user '" << user << "' group '" << group << "' on file '" << nodeCert << "'. Verify it yourself!";
 	}
 
 	/* disable the notifications feature */
@@ -475,8 +507,15 @@ int NodeSetupCommand::SetupNode(const boost::program_options::variables_map& vm,
 		}
 	}
 
-	/* tell the user to reload icinga2 */
-	Log(LogInformation, "cli", "Make sure to restart Icinga 2.");
+	/* If no parent connection was made, the user must supply the ca.crt before restarting Icinga 2.*/
+	if (!connectToParent) {
+		Log(LogWarning, "cli")
+		    << "No connection to the parent node was specified.\n\n"
+		    << "Please copy the public CA certificate from your master/satellite\n"
+		    << "into '" << nodeCA << "' before starting Icinga 2.\n";
+	} else {
+		Log(LogInformation, "cli", "Make sure to restart Icinga 2.");
+	}
 
 	return 0;
 }
